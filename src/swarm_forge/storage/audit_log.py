@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from swarm_forge.contracts.event import AuditEvent
+
 GENESIS_HASH = "0" * 64
 
 def utc_now() -> datetime:
@@ -87,14 +89,16 @@ class AuditLog:
                 """
             )
 
-    def append(
+    def _append_record(
         self,
         *,
+        event_id: str,
         run_id: str,
+        task_id: str | None,
         event_type: str,
+        timestamp: str,
         correlation_id: str,
         payload: dict[str, Any],
-        task_id: str | None = None,
     ) -> dict[str, Any]:
         if not run_id.strip():
             raise ValueError("run_id must not be blank")
@@ -118,9 +122,7 @@ class AuditLog:
                 """
             ).fetchone()
 
-            event_id: str = str(uuid4())
-            timestamp: str = utc_now().isoformat()
-            prev_hash: str = (
+            prev_hash = (
                 str(previous["event_hash"])
                 if previous is not None
                 else GENESIS_HASH
@@ -158,14 +160,14 @@ class AuditLog:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    event["event_id"],
-                    event["run_id"],
-                    event["task_id"],
-                    event["event_type"],
-                    event["timestamp"],
-                    event["correlation_id"],
-                    event["payload_json"],
-                    event["prev_hash"],
+                    event_id,
+                    run_id,
+                    task_id,
+                    event_type,
+                    timestamp,
+                    correlation_id,
+                    payload_json,
+                    prev_hash,
                     event_hash,
                 ),
             )
@@ -175,6 +177,50 @@ class AuditLog:
                 "payload": payload,
                 "event_hash": event_hash,
             }
+
+    def append(
+        self,
+        *,
+        run_id: str,
+        event_type: str,
+        correlation_id: str,
+        payload: dict[str, Any],
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a new event using a generated ID and timestamp."""
+        return self._append_record(
+            event_id=str(uuid4()),
+            run_id=run_id,
+            task_id=task_id,
+            event_type=event_type,
+            timestamp=utc_now().isoformat(),
+            correlation_id=correlation_id,
+            payload=payload,
+        )
+
+    def append_event(self, event: AuditEvent) -> AuditEvent:
+        """Persist an AuditEvent without changing its ID or timestamp."""
+        if event.prev_hash is not None or event.event_hash is not None:
+            raise ValueError(
+                "Hash fields must be assigned by AuditLog, not by the caller"
+            )
+
+        stored = self._append_record(
+            event_id=event.event_id,
+            run_id=event.run_id,
+            task_id=event.task_id,
+            event_type=event.event_type.value,
+            timestamp=event.timestamp.isoformat(),
+            correlation_id=event.correlation_id,
+            payload=event.payload,
+        )
+
+        return event.model_copy(
+            update={
+                "prev_hash": stored["prev_hash"],
+                "event_hash": stored["event_hash"],
+            }
+        )
 
     def list_events(self, run_id: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as connection:
