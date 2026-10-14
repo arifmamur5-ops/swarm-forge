@@ -27,6 +27,9 @@ class PolicyGate:
         max_attempts: int = 3,
         max_timeout_seconds: int = 600,
         max_changed_files: int = 10,
+        max_input_tokens: int = 8000,
+        max_output_tokens: int = 4000,
+        policy_version: str = "1.0",
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -34,11 +37,18 @@ class PolicyGate:
             raise ValueError("max_timeout_seconds must be at least 1")
         if max_changed_files < 1:
             raise ValueError("max_changed_files must be at least 1")
+        if max_input_tokens < 1:
+            raise ValueError("max_input_tokens must be at least 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be at least 1")
 
         self._allowed_tools = allowed_tools
         self._max_attempts = max_attempts
         self._max_timeout_seconds = max_timeout_seconds
         self._max_changed_files = max_changed_files
+        self._max_input_tokens = max_input_tokens
+        self._max_output_tokens = max_output_tokens
+        self._policy_version = policy_version
 
     def evaluate(self, task: TaskSpec) -> PolicyDecision:
         """Evaluate a task without writing to external storage."""
@@ -52,7 +62,7 @@ class PolicyGate:
                 f"tools_not_allowed:{','.join(unknown_tools)}"
             )
 
-        if task.budget.max_attempts > self._max_attempts:
+        if task.attempt >= task.budget.max_attempts or task.budget.max_attempts > self._max_attempts:
             reasons.append("max_attempts_exceeded")
 
         if task.budget.timeout_seconds > self._max_timeout_seconds:
@@ -61,9 +71,16 @@ class PolicyGate:
         if task.budget.max_changed_files > self._max_changed_files:
             reasons.append("max_changed_files_exceeded")
 
+        if task.budget.max_input_tokens > self._max_input_tokens:
+            reasons.append("max_input_tokens_exceeded")
+
+        if task.budget.max_output_tokens > self._max_output_tokens:
+            reasons.append("max_output_tokens_exceeded")
+
         return PolicyDecision(
             allowed=not reasons,
             reasons=tuple(reasons),
+            policy_version=self._policy_version,
         )
 
     def evaluate_and_audit(

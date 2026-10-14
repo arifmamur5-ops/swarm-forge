@@ -1,3 +1,5 @@
+import pytest
+
 from swarm_forge.contracts.event import EventType
 from swarm_forge.contracts.task import AgentRole, TaskSpec
 from swarm_forge.policy.gate import PolicyGate
@@ -92,3 +94,18 @@ def test_audit_log_records_both_decisions_in_one_hash_chain(
     ]
     assert events[1]["prev_hash"] == events[0]["event_hash"]
     assert audit_log.verify_chain() is True
+
+
+def test_audit_persistence_failure_propagates(tmp_path) -> None:
+    class FailingAuditLog:
+        def append_event(self, event):
+            raise OSError("audit storage unavailable")
+
+    task = make_task(tools=("read_file", "run_tests"))
+
+    with pytest.raises(OSError, match="audit storage unavailable"):
+        PolicyGate().evaluate_and_audit(
+            task,
+            FailingAuditLog(),
+            correlation_id="correlation-audit-failure",
+        )
