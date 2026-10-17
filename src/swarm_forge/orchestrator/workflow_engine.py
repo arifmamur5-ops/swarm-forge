@@ -90,7 +90,7 @@ class WorkflowEngine:
         if not ready_tasks:
             return None
 
-        return self.store.update_status(ready_tasks[0].task_id, TaskStatus.RUNNING)
+        return self.store.start_attempt(ready_tasks[0].task_id)
 
     def recover(self, run_id: str | None = None) -> list[TaskSpec]:
         """Re-evaluate readiness from persisted state after a restart.

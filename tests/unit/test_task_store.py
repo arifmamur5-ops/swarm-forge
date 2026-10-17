@@ -7,6 +7,7 @@ import pytest
 
 from swarm_forge.contracts.task import AgentRole, TaskBudget, TaskSpec, TaskStatus
 from swarm_forge.storage.task_store import (
+    AttemptLimitExceededError,
     DuplicateTaskError,
     TaskNotFoundError,
     TaskStore,
@@ -187,3 +188,67 @@ def test_sql_execution_error_triggers_rollback(task_store: TaskStore) -> None:
 
     retrieved = task_store.get_task(spec.task_id)
     assert retrieved.status == TaskStatus.CREATED
+
+
+def test_start_attempt_atomically_updates_status_and_counter(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-start-attempt",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Implement feature",
+        output_contract="code",
+    )
+    task_store.save_task(spec)
+    task_store.update_status(spec.task_id, TaskStatus.VALIDATED)
+    task_store.update_status(spec.task_id, TaskStatus.READY)
+
+    started = task_store.start_attempt(spec.task_id)
+
+    assert started.status == TaskStatus.RUNNING
+    assert started.attempt == 1
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.RUNNING
+    assert persisted.attempt == 1
+
+
+def test_start_attempt_rejects_exhausted_budget(task_store: TaskStore) -> None:
+    spec = TaskSpec(
+        task_id="task-attempt-limit",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Implement feature",
+        output_contract="code",
+        budget=TaskBudget(max_attempts=1),
+        attempt=1,
+        status=TaskStatus.READY,
+    )
+    task_store.save_task(spec)
+
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.start_attempt(spec.task_id)
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.READY
+    assert persisted.attempt == 1
+
+
+def test_start_attempt_rejects_non_ready_task_without_increment(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-not-ready",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Implement feature",
+        output_contract="code",
+    )
+    task_store.save_task(spec)
+
+    with pytest.raises(InvalidStateTransitionError):
+        task_store.start_attempt(spec.task_id)
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.CREATED
+    assert persisted.attempt == 0

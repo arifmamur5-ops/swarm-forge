@@ -25,6 +25,16 @@ class TaskNotFoundError(KeyError):
         self.task_id = task_id
 
 
+class AttemptLimitExceededError(ValueError):
+    """Raised when a task has exhausted its allowed execution attempts."""
+
+    def __init__(self, task_id: str, max_attempts: int) -> None:
+        super().__init__(
+            f"Task '{task_id}' has exhausted its maximum of {max_attempts} attempts."
+        )
+        self.task_id = task_id
+        self.max_attempts = max_attempts
+
 class TaskStore:
     """SQLite-backed persistent repository for TaskSpec objects."""
 
@@ -181,6 +191,61 @@ class TaskStore:
             return self._row_to_task_spec(updated_row)
         except Exception:
             conn.rollback()
+            raise
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
+    def start_attempt(self, task_id: str) -> TaskSpec:
+        """Atomically increment attempt and transition READY to RUNNING."""
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+
+            current_status = TaskStatus(row["status"])
+            validate_transition(current_status, TaskStatus.RUNNING)
+
+            budget_data = json.loads(row["budget_json"])
+            max_attempts = budget_data["max_attempts"]
+            if row["attempt"] >= max_attempts:
+                raise AttemptLimitExceededError(task_id, max_attempts)
+
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?, attempt = attempt + 1
+                WHERE task_id = ? AND status = ? AND attempt < ?
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    task_id,
+                    TaskStatus.READY.value,
+                    max_attempts,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"Could not atomically start attempt for task '{task_id}'."
+                )
+
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+
+            result = self._row_to_task_spec(row)
+            conn.commit()
+            return result
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
             raise
         finally:
             if self._persistent_conn is None:

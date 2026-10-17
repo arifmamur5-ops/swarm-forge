@@ -58,7 +58,9 @@ def test_task_without_dependencies_becomes_ready_and_can_be_claimed(
     assert claimed is not None
     assert claimed.task_id == "task-1"
     assert claimed.status == TaskStatus.RUNNING
+    assert claimed.attempt == 1
     assert store.get_task("task-1").status == TaskStatus.RUNNING
+    assert store.get_task("task-1").attempt == 1
 
 
 def test_dependent_task_waits_until_dependency_is_accepted(
