@@ -16,45 +16,63 @@ class InvalidStateTransitionError(ValueError):
 
 # Definisi aturan transisi status yang valid (Allowed Transitions)
 VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.CREATED: frozenset({
-        TaskStatus.VALIDATED,
-        TaskStatus.REJECTED,
-        TaskStatus.CANCELLED,
-    }),
-    TaskStatus.VALIDATED: frozenset({
-        TaskStatus.READY,
-        TaskStatus.BLOCKED,
-        TaskStatus.REJECTED,
-        TaskStatus.CANCELLED,
-    }),
-    TaskStatus.READY: frozenset({
-        TaskStatus.RUNNING,
-        TaskStatus.BLOCKED,
-        TaskStatus.CANCELLED,
-    }),
-    TaskStatus.RUNNING: frozenset({
-        TaskStatus.TESTING,
-        TaskStatus.FAILED,
-        TaskStatus.BLOCKED,
-        TaskStatus.CANCELLED,
-    }),
-    TaskStatus.TESTING: frozenset({
-        TaskStatus.REVIEW,
-        TaskStatus.FAILED,
-        TaskStatus.BLOCKED,
-    }),
-    TaskStatus.REVIEW: frozenset({
-        TaskStatus.ACCEPTED,
-        TaskStatus.READY,
-        TaskStatus.REJECTED,
-    }),
-    TaskStatus.BLOCKED: frozenset({
-        TaskStatus.READY,
-        TaskStatus.CANCELLED,
-    }),
-    # Status terminal: tidak boleh ada transisi keluar
+    TaskStatus.CREATED: frozenset(
+        {
+            TaskStatus.VALIDATED,
+            TaskStatus.REJECTED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.VALIDATED: frozenset(
+        {
+            TaskStatus.READY,
+            TaskStatus.BLOCKED,
+            TaskStatus.REJECTED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.READY: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.RUNNING: frozenset(
+        {
+            TaskStatus.TESTING,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.TESTING: frozenset(
+        {
+            TaskStatus.REVIEW,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+        }
+    ),
+    TaskStatus.REVIEW: frozenset(
+        {
+            TaskStatus.ACCEPTED,
+            TaskStatus.READY,
+            TaskStatus.REJECTED,
+        }
+    ),
+    TaskStatus.BLOCKED: frozenset(
+        {
+            TaskStatus.READY,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    # Status terminal (kecuali FAILED yang bisa di-retry kembali ke READY):
     TaskStatus.ACCEPTED: frozenset(),
-    TaskStatus.FAILED: frozenset(),
+    TaskStatus.FAILED: frozenset(
+        {
+            TaskStatus.READY,
+        }
+    ),
     TaskStatus.REJECTED: frozenset(),
     TaskStatus.CANCELLED: frozenset(),
 }

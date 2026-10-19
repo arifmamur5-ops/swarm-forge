@@ -65,7 +65,13 @@ def test_create_and_get_task_full_fields(task_store: TaskStore) -> None:
 
 
 def test_duplicate_task_raises_error(task_store: TaskStore) -> None:
-    spec = TaskSpec(task_id="task-dup", run_id="run-1", agent_role=AgentRole.PLANNER, goal="Plan", output_contract="plan")
+    spec = TaskSpec(
+        task_id="task-dup",
+        run_id="run-1",
+        agent_role=AgentRole.PLANNER,
+        goal="Plan",
+        output_contract="plan",
+    )
     task_store.save_task(spec)
 
     with pytest.raises(DuplicateTaskError):
@@ -78,8 +84,18 @@ def test_task_not_found_raises_error(task_store: TaskStore) -> None:
 
 
 def test_list_tasks_with_and_without_filter(task_store: TaskStore) -> None:
-    task1 = TaskSpec(run_id="run-A", agent_role=AgentRole.ANALYST, goal="Goal A", output_contract="contract A")
-    task2 = TaskSpec(run_id="run-B", agent_role=AgentRole.QA, goal="Goal B", output_contract="contract B")
+    task1 = TaskSpec(
+        run_id="run-A",
+        agent_role=AgentRole.ANALYST,
+        goal="Goal A",
+        output_contract="contract A",
+    )
+    task2 = TaskSpec(
+        run_id="run-B",
+        agent_role=AgentRole.QA,
+        goal="Goal B",
+        output_contract="contract B",
+    )
 
     task_store.save_task(task1)
     task_store.save_task(task2)
@@ -93,7 +109,12 @@ def test_list_tasks_with_and_without_filter(task_store: TaskStore) -> None:
 
 
 def test_update_status_valid_transition(task_store: TaskStore) -> None:
-    spec = TaskSpec(run_id="run-1", agent_role=AgentRole.IMPLEMENTER, goal="Code", output_contract="code")
+    spec = TaskSpec(
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Code",
+        output_contract="code",
+    )
     task_store.save_task(spec)
 
     updated = task_store.update_status(spec.task_id, TaskStatus.VALIDATED)
@@ -104,12 +125,21 @@ def test_update_status_valid_transition(task_store: TaskStore) -> None:
     assert retrieved.status == TaskStatus.VALIDATED
 
 
-def test_update_status_invalid_transition_raises_and_rolls_back(task_store: TaskStore) -> None:
-    spec = TaskSpec(run_id="run-1", agent_role=AgentRole.IMPLEMENTER, goal="Code", output_contract="code")
+def test_update_status_invalid_transition_raises_and_rolls_back(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Code",
+        output_contract="code",
+    )
     task_store.save_task(spec)
 
     with pytest.raises(InvalidStateTransitionError):
-        task_store.update_status(spec.task_id, TaskStatus.RUNNING)  # CREATED -> RUNNING is illegal
+        task_store.update_status(
+            spec.task_id, TaskStatus.RUNNING
+        )  # CREATED -> RUNNING is illegal
 
     # Verify status remains unchanged (atomicity / rollback check)
     retrieved = task_store.get_task(spec.task_id)
@@ -118,10 +148,15 @@ def test_update_status_invalid_transition_raises_and_rolls_back(task_store: Task
 
 def test_persistence_across_restarts(tmp_path: Path) -> None:
     db_file = tmp_path / "persist.db"
-    
+
     # Store and close session
     store1 = TaskStore(db_path=db_file)
-    spec = TaskSpec(run_id="run-persist", agent_role=AgentRole.ARCHITECT, goal="Design", output_contract="design")
+    spec = TaskSpec(
+        run_id="run-persist",
+        agent_role=AgentRole.ARCHITECT,
+        goal="Design",
+        output_contract="design",
+    )
     store1.save_task(spec)
     store1.update_status(spec.task_id, TaskStatus.VALIDATED)
 
@@ -136,18 +171,29 @@ def test_persistence_across_restarts(tmp_path: Path) -> None:
 
 def test_in_memory_database_support_and_close() -> None:
     store = TaskStore(db_path=":memory:")
-    spec = TaskSpec(run_id="run-mem", agent_role=AgentRole.QA, goal="Test memory", output_contract="test")
+    spec = TaskSpec(
+        run_id="run-mem",
+        agent_role=AgentRole.QA,
+        goal="Test memory",
+        output_contract="test",
+    )
     store.save_task(spec)
     retrieved = store.get_task(spec.task_id)
     assert retrieved.task_id == spec.task_id
-    
+
     # Test explicit close lifecycle method
     store.close()
 
 
 def test_in_memory_duplicate_task_handling() -> None:
     store = TaskStore(db_path=":memory:")
-    spec = TaskSpec(task_id="task-mem-dup", run_id="run-mem", agent_role=AgentRole.PLANNER, goal="Memory dup test", output_contract="test")
+    spec = TaskSpec(
+        task_id="task-mem-dup",
+        run_id="run-mem",
+        agent_role=AgentRole.PLANNER,
+        goal="Memory dup test",
+        output_contract="test",
+    )
     store.save_task(spec)
 
     with pytest.raises(DuplicateTaskError):
@@ -188,6 +234,115 @@ def test_sql_execution_error_triggers_rollback(task_store: TaskStore) -> None:
 
     retrieved = task_store.get_task(spec.task_id)
     assert retrieved.status == TaskStatus.CREATED
+
+
+def test_retry_task_returns_failed_task_to_ready_without_increment(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-retry-success",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Retry implementation",
+        output_contract="code",
+        budget=TaskBudget(max_attempts=3),
+        status=TaskStatus.FAILED,
+        attempt=1,
+    )
+    task_store.save_task(spec)
+
+    retried = task_store.retry_task(spec.task_id)
+
+    assert retried.status == TaskStatus.READY
+    assert retried.attempt == 1
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.READY
+    assert persisted.attempt == 1
+
+
+def test_retry_task_rejects_exhausted_attempt_budget(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-retry-exhausted",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Exhausted retry",
+        output_contract="code",
+        budget=TaskBudget(max_attempts=2),
+        status=TaskStatus.FAILED,
+        attempt=2,
+    )
+    task_store.save_task(spec)
+
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.retry_task(spec.task_id)
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.FAILED
+    assert persisted.attempt == 2
+
+
+def test_retry_task_rejects_non_failed_task(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-retry-invalid-state",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Invalid retry state",
+        output_contract="code",
+        status=TaskStatus.CREATED,
+    )
+    task_store.save_task(spec)
+
+    with pytest.raises(InvalidStateTransitionError):
+        task_store.retry_task(spec.task_id)
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.CREATED
+    assert persisted.attempt == 0
+
+
+def test_retry_task_rejects_unknown_task(task_store: TaskStore) -> None:
+    with pytest.raises(TaskNotFoundError):
+        task_store.retry_task("missing-retry-task")
+
+
+def test_full_retry_lifecycle_increments_attempt_only_on_start(
+    task_store: TaskStore,
+) -> None:
+    spec = TaskSpec(
+        task_id="task-retry-lifecycle",
+        run_id="run-1",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Verify retry lifecycle",
+        output_contract="code",
+        budget=TaskBudget(max_attempts=2),
+        status=TaskStatus.READY,
+    )
+    task_store.save_task(spec)
+
+    first_start = task_store.start_attempt(spec.task_id)
+    assert first_start.status == TaskStatus.RUNNING
+    assert first_start.attempt == 1
+
+    failed = task_store.update_status(spec.task_id, TaskStatus.FAILED)
+    assert failed.status == TaskStatus.FAILED
+    assert failed.attempt == 1
+
+    retried = task_store.retry_task(spec.task_id)
+    assert retried.status == TaskStatus.READY
+    assert retried.attempt == 1
+
+    second_start = task_store.start_attempt(spec.task_id)
+    assert second_start.status == TaskStatus.RUNNING
+    assert second_start.attempt == 2
+
+    persisted = task_store.get_task(spec.task_id)
+    assert persisted.status == TaskStatus.RUNNING
+    assert persisted.attempt == 2
 
 
 def test_start_attempt_atomically_updates_status_and_counter(

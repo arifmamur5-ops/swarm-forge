@@ -35,13 +35,14 @@ class AttemptLimitExceededError(ValueError):
         self.task_id = task_id
         self.max_attempts = max_attempts
 
+
 class TaskStore:
     """SQLite-backed persistent repository for TaskSpec objects."""
 
     def __init__(self, db_path: str | Path = "swarm_forge.db") -> None:
         self.db_path = Path(db_path) if isinstance(db_path, str) else db_path
         self._persistent_conn: sqlite3.Connection | None = None
-        
+
         # Handle in-memory database explicitly by keeping a single persistent connection open
         if str(self.db_path) == ":memory:":
             self._persistent_conn = sqlite3.connect(":memory:")
@@ -57,7 +58,11 @@ class TaskStore:
         return conn
 
     def _init_db(self) -> None:
-        if str(self.db_path) != ":memory:" and self.db_path != Path(":memory:") and self.db_path.parent != Path("."):
+        if (
+            str(self.db_path) != ":memory:"
+            and self.db_path != Path(":memory:")
+            and self.db_path.parent != Path(".")
+        ):
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         conn = self._get_connection()
@@ -165,7 +170,7 @@ class TaskStore:
         conn = self._get_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            
+
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
             row = cursor.fetchone()
@@ -174,7 +179,7 @@ class TaskStore:
                 raise TaskNotFoundError(task_id)
 
             current_status = TaskStatus(row["status"])
-            
+
             # Validate via workflow state machine
             validate_transition(current_status, new_status)
 
@@ -251,6 +256,65 @@ class TaskStore:
             if self._persistent_conn is None:
                 conn.close()
 
+    def retry_task(self, task_id: str) -> TaskSpec:
+        """Atomically return a FAILED task to READY if attempts remain.
+
+        The attempt counter is unchanged here. It increments only when
+        start_attempt() successfully starts the next execution.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id)
+
+            current_status = TaskStatus(row["status"])
+            validate_transition(current_status, TaskStatus.READY)
+
+            budget_data = json.loads(row["budget_json"])
+            max_attempts = budget_data["max_attempts"]
+            if row["attempt"] >= max_attempts:
+                raise AttemptLimitExceededError(task_id, max_attempts)
+
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = ?
+                WHERE task_id = ?
+                  AND status = ?
+                  AND attempt < ?
+                """,
+                (
+                    TaskStatus.READY.value,
+                    task_id,
+                    TaskStatus.FAILED.value,
+                    max_attempts,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Could not atomically retry task '{task_id}'.")
+
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if updated_row is None:
+                raise TaskNotFoundError(task_id)
+
+            result = self._row_to_task_spec(updated_row)
+            conn.commit()
+            return result
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            if self._persistent_conn is None:
+                conn.close()
+
     def _row_to_task_spec(self, row: sqlite3.Row) -> TaskSpec:
         budget_data = json.loads(row["budget_json"])
         depends_on_tuple = tuple(json.loads(row["depends_on_json"]))
@@ -271,4 +335,4 @@ class TaskStore:
             status=TaskStatus(row["status"]),
             attempt=row["attempt"],
             created_at=datetime.fromisoformat(row["created_at"]),
-        ) 
+        )

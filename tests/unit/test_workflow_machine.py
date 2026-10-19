@@ -20,6 +20,7 @@ from swarm_forge.workflow.state_machine import (
         (TaskStatus.TESTING, TaskStatus.REVIEW),
         (TaskStatus.REVIEW, TaskStatus.ACCEPTED),
         (TaskStatus.BLOCKED, TaskStatus.READY),
+        (TaskStatus.FAILED, TaskStatus.READY),
     ],
 )
 def test_valid_transitions(current: TaskStatus, target: TaskStatus) -> None:
@@ -33,7 +34,6 @@ def test_valid_transitions(current: TaskStatus, target: TaskStatus) -> None:
         (TaskStatus.CREATED, TaskStatus.RUNNING),
         (TaskStatus.READY, TaskStatus.ACCEPTED),
         (TaskStatus.ACCEPTED, TaskStatus.RUNNING),
-        (TaskStatus.FAILED, TaskStatus.READY),
         (TaskStatus.CANCELLED, TaskStatus.VALIDATED),
     ],
 )
@@ -49,7 +49,7 @@ def test_transition_to_same_status_raises() -> None:
 
 def test_terminal_statuses() -> None:
     assert is_terminal_status(TaskStatus.ACCEPTED) is True
-    assert is_terminal_status(TaskStatus.FAILED) is True
+    assert is_terminal_status(TaskStatus.FAILED) is False
     assert is_terminal_status(TaskStatus.REJECTED) is True
     assert is_terminal_status(TaskStatus.CANCELLED) is True
 
