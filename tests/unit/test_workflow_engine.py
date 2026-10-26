@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from swarm_forge.contracts.claim import AttemptStatus, TaskClaim
 from swarm_forge.contracts.task import AgentRole, TaskSpec, TaskStatus
 from swarm_forge.orchestrator.workflow_engine import (
     WorkflowEngine,
@@ -41,6 +43,22 @@ def make_task(
     )
 
 
+def transition_claim(
+    engine: WorkflowEngine,
+    claim: TaskClaim,
+    expected_task_status: TaskStatus,
+    new_task_status: TaskStatus,
+) -> TaskSpec:
+    return engine.transition_attempt_status(
+        task_id=claim.task.task_id,
+        attempt_id=claim.attempt_id,
+        attempt_no=claim.attempt_no,
+        expected_attempt_status=AttemptStatus.RUNNING,
+        expected_task_status=expected_task_status,
+        new_task_status=new_task_status,
+    )
+
+
 def test_task_without_dependencies_becomes_ready_and_can_be_claimed(
     engine: WorkflowEngine,
     store: TaskStore,
@@ -54,11 +72,14 @@ def test_task_without_dependencies_becomes_ready_and_can_be_claimed(
     changed = engine.refresh_ready_tasks()
     assert [item.task_id for item in changed] == ["task-1"]
 
-    claimed = engine.claim_next_task()
+    claim_result = engine.claim_next_task(
+        worker_id="worker-1", claim_request_id="engine-claim-1"
+    )
+    claimed = claim_result.claim
     assert claimed is not None
-    assert claimed.task_id == "task-1"
-    assert claimed.status == TaskStatus.RUNNING
-    assert claimed.attempt == 1
+    assert claimed.task.task_id == "task-1"
+    assert claimed.task.status == TaskStatus.RUNNING
+    assert claimed.attempt_no == 1
     assert store.get_task("task-1").status == TaskStatus.RUNNING
     assert store.get_task("task-1").attempt == 1
 
@@ -81,10 +102,20 @@ def test_dependent_task_waits_until_dependency_is_accepted(
     assert store.get_task("child").status == TaskStatus.VALIDATED
 
     # Complete the parent's lifecycle through the existing state machine.
-    store.update_status("parent", TaskStatus.RUNNING)
-    store.update_status("parent", TaskStatus.TESTING)
-    store.update_status("parent", TaskStatus.REVIEW)
-    store.update_status("parent", TaskStatus.ACCEPTED)
+    parent_claim = engine.claim_next_task(
+        run_id="run-1", worker_id="worker-1", claim_request_id="parent-claim"
+    )
+    assert parent_claim.claim is not None
+    assert parent_claim.claim.task.task_id == "parent"
+    transition_claim(
+        engine, parent_claim.claim, TaskStatus.RUNNING, TaskStatus.TESTING
+    )
+    transition_claim(
+        engine, parent_claim.claim, TaskStatus.TESTING, TaskStatus.REVIEW
+    )
+    transition_claim(
+        engine, parent_claim.claim, TaskStatus.REVIEW, TaskStatus.ACCEPTED
+    )
 
     changed = engine.refresh_ready_tasks()
     assert [item.task_id for item in changed] == ["child"]
@@ -161,14 +192,19 @@ def test_recovery_preserves_persisted_states(tmp_path: Path) -> None:
     store1 = TaskStore(db_path=db_path)
     engine1 = WorkflowEngine(store1)
 
-    engine1.register_task(make_task("ready-task"))
-    engine1.register_task(make_task("running-task"))
+    engine1.register_task(make_task("ready-task", run_id="run-ready"))
+    engine1.register_task(make_task("running-task", run_id="run-running"))
 
     engine1.validate_task("ready-task")
     engine1.validate_task("running-task")
     engine1.refresh_ready_tasks()
 
-    store1.update_status("running-task", TaskStatus.RUNNING)
+    running_claim = engine1.claim_next_task(
+        run_id="run-running",
+        worker_id="worker-1",
+        claim_request_id="running-recovery-setup",
+    )
+    assert running_claim.claim is not None
 
     store2 = TaskStore(db_path=db_path)
     engine2 = WorkflowEngine(store2)
@@ -195,10 +231,21 @@ def test_recovery_marks_task_ready_when_dependencies_are_accepted(
 
     # Parent sudah selesai sebelum proses restart.
     store1.update_status("parent", TaskStatus.READY)
-    store1.update_status("parent", TaskStatus.RUNNING)
-    store1.update_status("parent", TaskStatus.TESTING)
-    store1.update_status("parent", TaskStatus.REVIEW)
-    store1.update_status("parent", TaskStatus.ACCEPTED)
+    parent_claim = engine1.claim_next_task(
+        run_id="run-1",
+        worker_id="worker-1",
+        claim_request_id="accepted-dependency-parent",
+    )
+    assert parent_claim.claim is not None
+    transition_claim(
+        engine1, parent_claim.claim, TaskStatus.RUNNING, TaskStatus.TESTING
+    )
+    transition_claim(
+        engine1, parent_claim.claim, TaskStatus.TESTING, TaskStatus.REVIEW
+    )
+    transition_claim(
+        engine1, parent_claim.claim, TaskStatus.REVIEW, TaskStatus.ACCEPTED
+    )
 
     store2 = TaskStore(db_path=db_path)
     engine2 = WorkflowEngine(store2)
@@ -208,3 +255,27 @@ def test_recovery_marks_task_ready_when_dependencies_are_accepted(
     assert [task.task_id for task in ready] == ["child"]
     assert store2.get_task("child").status == TaskStatus.READY
     assert store2.get_task("parent").status == TaskStatus.ACCEPTED
+
+
+def test_engine_recover_requeues_expired_attempt(tmp_path: Path) -> None:
+    db_path = tmp_path / "workflow-expired-recovery.db"
+    store = TaskStore(db_path)
+    engine = WorkflowEngine(store)
+    task = make_task("expired-workflow-task")
+    engine.register_task(task)
+    engine.validate_task(task.task_id)
+    engine.refresh_ready_tasks()
+    result = engine.claim_next_task(
+        worker_id="worker-recover", claim_request_id="workflow-expired-claim"
+    )
+    assert result.claim is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE task_attempts SET lease_expires_at = ? WHERE attempt_id = ?",
+            ("2000-01-01T00:00:00+00:00", result.claim.attempt_id),
+        )
+
+    recovered = WorkflowEngine(TaskStore(db_path)).recover()
+
+    assert [item.task_id for item in recovered] == [task.task_id]
+    assert store.get_task(task.task_id).status == TaskStatus.READY

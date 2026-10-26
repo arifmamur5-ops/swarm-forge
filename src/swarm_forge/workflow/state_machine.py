@@ -57,6 +57,7 @@ VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.ACCEPTED,
             TaskStatus.READY,
+            TaskStatus.FAILED,
             TaskStatus.REJECTED,
         }
     ),

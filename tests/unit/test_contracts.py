@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from pydantic import ValidationError
 
@@ -30,6 +32,18 @@ def test_task_gets_id_and_default_budget() -> None:
     assert task.task_id
     assert task.budget.max_attempts == 3
     assert task.status == TaskStatus.CREATED
+
+def test_task_created_at_rejects_naive_datetime() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        make_task(created_at=datetime(2026, 1, 1))
+
+def test_task_created_at_accepts_timezone_aware_datetime() -> None:
+    created_at = datetime(2026, 1, 1, 12, tzinfo=timezone(timedelta(hours=7)))
+
+    task = make_task(created_at=created_at)
+
+    assert task.created_at == created_at
+    assert task.created_at.utcoffset() == timedelta(hours=7)
 
 def test_blank_goal_is_rejected() -> None:
     with pytest.raises(ValidationError):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+
+from swarm_forge.contracts.claim import AttemptStatus, ClaimResult
 from swarm_forge.contracts.task import TaskSpec, TaskStatus
 from swarm_forge.storage.task_store import TaskNotFoundError, TaskStore
 
@@ -81,23 +84,63 @@ class WorkflowEngine:
         ]
         return sorted(tasks, key=lambda task: (task.created_at, task.task_id))
 
-    def claim_next_task(self, run_id: str | None = None) -> TaskSpec | None:
-        """Claim the next READY task by transitioning it to RUNNING.
+    def claim_next_task(
+        self,
+        *,
+        worker_id: str,
+        claim_request_id: str,
+        run_id: str | None = None,
+    ) -> ClaimResult:
+        """Atomically claim the next eligible task without executing it."""
+        return self.store.claim_next_task(
+            run_id=run_id,
+            worker_id=worker_id,
+            claim_request_id=claim_request_id,
+        )
 
-        This changes workflow state only; it does not execute an agent.
-        """
-        ready_tasks = self.get_ready_tasks(run_id=run_id)
-        if not ready_tasks:
-            return None
+    def transition_attempt_status(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        attempt_no: int,
+        expected_attempt_status: AttemptStatus,
+        expected_task_status: TaskStatus,
+        new_task_status: TaskStatus,
+    ) -> TaskSpec:
+        """Apply a workflow transition using the claim's attempt fence."""
+        return self.store.transition_attempt_status(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            attempt_no=attempt_no,
+            expected_attempt_status=expected_attempt_status,
+            expected_task_status=expected_task_status,
+            new_task_status=new_task_status,
+        )
 
-        return self.store.start_attempt(ready_tasks[0].task_id)
+    def heartbeat_attempt(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        attempt_no: int,
+        worker_id: str,
+    ) -> datetime:
+        """Renew the lease for the matching active worker attempt."""
+        return self.store.heartbeat_attempt(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            attempt_no=attempt_no,
+            worker_id=worker_id,
+        )
 
     def recover(self, run_id: str | None = None) -> list[TaskSpec]:
-        """Re-evaluate readiness from persisted state after a restart.
+        """Recover expired attempts and return a snapshot of all READY tasks.
 
-        RUNNING tasks are deliberately left RUNNING. Recovery never assumes
-        that interrupted work succeeded or automatically re-executes it.
+        The returned list is the current READY queue after recovery, not only
+        the tasks transitioned by this invocation.
         """
+        self.store.recover_expired_attempts(run_id=run_id)
         self.refresh_ready_tasks(run_id=run_id)
         return self.get_ready_tasks(run_id=run_id)
 

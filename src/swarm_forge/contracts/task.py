@@ -63,6 +63,13 @@ class TaskSpec(BaseModel):
     attempt: int = Field(default=0, ge=0)
     created_at: datetime = Field(default_factory=utc_now)
 
+    @field_validator("created_at")
+    @classmethod
+    def require_timezone_aware_created_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("Task created_at must be timezone-aware")
+        return value
+
     @field_validator("task_id", "run_id", "output_contract")
     @classmethod
     def reject_blank_strings(cls, value: str) -> str:
