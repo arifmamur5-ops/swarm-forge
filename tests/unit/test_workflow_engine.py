@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from swarm_forge.contracts.claim import AttemptStatus, TaskClaim
-from swarm_forge.contracts.task import AgentRole, TaskSpec, TaskStatus
+from swarm_forge.contracts.task import AgentRole, TaskBudget, TaskSpec, TaskStatus
 from swarm_forge.orchestrator.workflow_engine import (
     WorkflowEngine,
     WorkflowValidationError,
@@ -279,3 +279,65 @@ def test_engine_recover_requeues_expired_attempt(tmp_path: Path) -> None:
 
     assert [item.task_id for item in recovered] == [task.task_id]
     assert store.get_task(task.task_id).status == TaskStatus.READY
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_workflow_registration_rejects_budget_above_global_cap(
+    engine: WorkflowEngine, max_attempts: int
+) -> None:
+    task = make_task(
+        f"over-cap-registration-{max_attempts}"
+    ).model_copy(update={"budget": TaskBudget(max_attempts=max_attempts)})
+
+    with pytest.raises(ValueError, match="global maximum of 3"):
+        engine.register_task(task)
+
+    assert engine.store.list_tasks() == []
+
+
+def test_workflow_cannot_validate_historical_created_task_above_cap(
+    engine: WorkflowEngine,
+) -> None:
+    task = make_task("historical-created-over-cap")
+    engine.register_task(task)
+    with sqlite3.connect(engine.store.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET budget_json = ? WHERE task_id = ?",
+            (TaskBudget(max_attempts=4).model_dump_json(), task.task_id),
+        )
+
+    with pytest.raises(WorkflowValidationError, match="global max_attempts"):
+        engine.validate_task(task.task_id)
+
+    assert engine.store.get_task(task.task_id).status == TaskStatus.CREATED
+
+
+def test_workflow_recovery_does_not_requeue_expired_historical_task_above_cap(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "workflow-historical-over-cap.db"
+    store = TaskStore(db_path)
+    engine = WorkflowEngine(store)
+    task = make_task("workflow-historical-expired")
+    engine.register_task(task)
+    engine.validate_task(task.task_id)
+    engine.refresh_ready_tasks()
+    claim_result = engine.claim_next_task(
+        worker_id="worker-historical-expired",
+        claim_request_id="claim-historical-expired",
+    )
+    assert claim_result.claim is not None
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET budget_json = ? WHERE task_id = ?",
+            (TaskBudget(max_attempts=5).model_dump_json(), task.task_id),
+        )
+        connection.execute(
+            "UPDATE task_attempts SET lease_expires_at = ? WHERE attempt_id = ?",
+            ("2000-01-01T00:00:00+00:00", claim_result.claim.attempt_id),
+        )
+
+    assert WorkflowEngine(TaskStore(db_path)).recover() == []
+    assert store.get_task(task.task_id).status == TaskStatus.FAILED
+    assert store.get_task(task.task_id).attempt == 1

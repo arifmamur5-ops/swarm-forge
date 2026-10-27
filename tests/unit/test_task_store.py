@@ -81,6 +81,17 @@ def make_legacy_database(db_file: Path, spec: TaskSpec) -> None:
         )
 
 
+def replace_persisted_budget(
+    store: TaskStore, task_id: str, budget: TaskBudget
+) -> None:
+    """Model a task budget written by an older release."""
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET budget_json = ? WHERE task_id = ?",
+            (budget.model_dump_json(), task_id),
+        )
+
+
 def insert_attempt(
     connection: sqlite3.Connection,
     *,
@@ -558,7 +569,7 @@ def test_running_attempt_requires_a_lease_expiry(task_store: TaskStore) -> None:
         connection.close()
 
 
-def test_create_and_get_task_full_fields(task_store: TaskStore) -> None:
+def test_read_historical_task_full_fields(task_store: TaskStore) -> None:
     spec = TaskSpec(
         task_id="custom-task-001",
         run_id="run-123",
@@ -579,7 +590,10 @@ def test_create_and_get_task_full_fields(task_store: TaskStore) -> None:
         attempt=1,
     )
 
-    task_store.save_task(spec)
+    task_store.save_task(
+        spec.model_copy(update={"budget": TaskBudget(max_attempts=3)})
+    )
+    replace_persisted_budget(task_store, spec.task_id, spec.budget)
     retrieved = task_store.get_task(spec.task_id)
 
     assert retrieved.task_id == spec.task_id
@@ -2101,6 +2115,47 @@ def test_recovery_task_write_failure_rolls_back_attempt_abandonment(
         ).fetchone() == ("running", None, None)
 
 
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_historical_over_cap_recovery_task_write_failure_rolls_back_abandonment(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    claim = claim_task_at_review(
+        task_store, f"historical-recovery-rollback-{max_attempts}"
+    )
+    replace_persisted_budget(
+        task_store, claim.task.task_id, TaskBudget(max_attempts=max_attempts)
+    )
+    expire_attempt(task_store, claim)
+    with sqlite3.connect(task_store.db_path) as connection:
+        connection.execute(
+            f"""
+            CREATE TRIGGER fail_historical_recovery_task_update
+            BEFORE UPDATE OF status ON tasks
+            WHEN OLD.task_id = '{claim.task.task_id}'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced historical recovery task update failure');
+            END
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="forced historical recovery task update failure",
+    ):
+        task_store.recover_expired_attempts()
+
+    persisted = task_store.get_task(claim.task.task_id)
+    assert persisted.status == TaskStatus.REVIEW
+    assert persisted.attempt == 1
+    assert persisted.budget.max_attempts == max_attempts
+    with sqlite3.connect(task_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT status, finished_at, reason_code FROM task_attempts "
+            "WHERE attempt_id = ?",
+            (claim.attempt_id,),
+        ).fetchone() == ("running", None, None)
+
+
 def test_recovery_waiting_for_write_lock_uses_time_after_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2229,3 +2284,256 @@ def test_two_stores_recover_an_expired_attempt_only_once(tmp_path: Path) -> None
             "SELECT status FROM task_attempts WHERE attempt_id = ?",
             (claim.attempt_id,),
         ).fetchone() == ("abandoned",)
+
+
+@pytest.mark.parametrize("max_attempts", [1, 3])
+def test_new_task_budgets_within_global_cap_can_be_persisted_and_claimed(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    task = TaskSpec(
+        task_id=f"within-global-cap-{max_attempts}",
+        run_id="run-global-cap",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Run within the configured attempt policy",
+        output_contract="patch",
+        budget=TaskBudget(max_attempts=max_attempts),
+        status=TaskStatus.READY,
+    )
+    task_store.save_task(task)
+
+    result = task_store.claim_next_task(
+        worker_id="worker-global-cap",
+        claim_request_id=f"claim-within-cap-{max_attempts}",
+    )
+
+    assert result.claim is not None
+    assert result.claim.attempt_no == 1
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_new_task_budget_above_global_cap_is_rejected(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    task = TaskSpec(
+        task_id=f"new-over-global-cap-{max_attempts}",
+        run_id="run-global-cap",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Must not request more than the global cap",
+        output_contract="patch",
+        budget=TaskBudget(max_attempts=max_attempts),
+    )
+
+    with pytest.raises(ValueError, match="global maximum of 3"):
+        task_store.save_task(task)
+
+    assert task_store.list_tasks() == []
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_historical_over_cap_task_remains_readable_but_cannot_be_claimed(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    task = TaskSpec(
+        task_id=f"historical-over-cap-ready-{max_attempts}",
+        run_id="run-historical-cap",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Remain readable without starting another attempt",
+        output_contract="patch",
+        status=TaskStatus.READY,
+    )
+    task_store.save_task(task)
+    replace_persisted_budget(task_store, task.task_id, TaskBudget(max_attempts=max_attempts))
+
+    persisted = task_store.get_task(task.task_id)
+    result = task_store.claim_next_task(
+        worker_id="worker-historical-cap",
+        claim_request_id=f"claim-historical-cap-{max_attempts}",
+    )
+
+    assert persisted.budget.max_attempts == max_attempts
+    assert result.claim is None
+    assert result.skipped_candidates[0].reason.value == "attempt_budget_exhausted"
+    assert task_store.get_task(task.task_id).attempt == 0
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_historical_over_cap_failed_or_blocked_task_cannot_return_to_ready(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    failed = TaskSpec(
+        task_id=f"historical-failed-over-cap-{max_attempts}",
+        run_id="run-historical-cap",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="A failed historical task cannot be retried",
+        output_contract="patch",
+        status=TaskStatus.FAILED,
+    )
+    blocked = TaskSpec(
+        task_id=f"historical-blocked-over-cap-{max_attempts}",
+        run_id="run-historical-cap",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="A blocked historical task cannot be re-enabled",
+        output_contract="patch",
+        status=TaskStatus.BLOCKED,
+    )
+    task_store.save_task(failed)
+    task_store.save_task(blocked)
+    replace_persisted_budget(task_store, failed.task_id, TaskBudget(max_attempts=max_attempts))
+    replace_persisted_budget(task_store, blocked.task_id, TaskBudget(max_attempts=max_attempts))
+
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.retry_task(failed.task_id)
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.update_status(failed.task_id, TaskStatus.READY)
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.update_status(blocked.task_id, TaskStatus.READY)
+
+    assert task_store.get_task(failed.task_id).status == TaskStatus.FAILED
+    assert task_store.get_task(blocked.task_id).status == TaskStatus.BLOCKED
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_historical_over_cap_active_attempt_may_finish_but_cannot_retry(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    claim = claim_task_at_review(task_store, f"historical-active-{max_attempts}")
+    replace_persisted_budget(
+        task_store, claim.task.task_id, TaskBudget(max_attempts=max_attempts)
+    )
+
+    failed = transition_claim(
+        task_store, claim, TaskStatus.REVIEW, TaskStatus.FAILED
+    )
+
+    assert failed.status == TaskStatus.FAILED
+    assert task_store.get_task(claim.task.task_id).budget.max_attempts == max_attempts
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.retry_task(claim.task.task_id)
+
+
+def test_historical_over_cap_active_attempt_can_complete_successfully(
+    task_store: TaskStore,
+) -> None:
+    claim = claim_task_at_review(task_store, "historical-active-success")
+    replace_persisted_budget(task_store, claim.task.task_id, TaskBudget(max_attempts=4))
+
+    accepted = transition_claim(
+        task_store, claim, TaskStatus.REVIEW, TaskStatus.ACCEPTED
+    )
+
+    assert accepted.status == TaskStatus.ACCEPTED
+    assert task_store.get_task(claim.task.task_id).attempt == 1
+
+
+@pytest.mark.parametrize("max_attempts", [4, 5])
+def test_expired_historical_over_cap_attempt_is_failed_atomically_and_once(
+    task_store: TaskStore, max_attempts: int
+) -> None:
+    claim = claim_task_at_review(
+        task_store, f"expired-historical-over-cap-{max_attempts}"
+    )
+    replace_persisted_budget(
+        task_store, claim.task.task_id, TaskBudget(max_attempts=max_attempts)
+    )
+    expire_attempt(task_store, claim)
+
+    recovered = task_store.recover_expired_attempts()
+
+    assert [task.status for task in recovered] == [TaskStatus.FAILED]
+    assert recovered[0].attempt == 1
+    assert task_store.recover_expired_attempts() == []
+    assert task_store.get_task(claim.task.task_id).status == TaskStatus.FAILED
+    assert task_store.get_task(claim.task.task_id).attempt == 1
+    with sqlite3.connect(task_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT status, reason_code FROM task_attempts WHERE attempt_id = ?",
+            (claim.attempt_id,),
+        ).fetchone() == ("abandoned", "lease_expired")
+
+
+def test_historical_over_cap_review_attempt_cannot_transition_back_to_ready(
+    task_store: TaskStore,
+) -> None:
+    claim = claim_task_at_review(task_store, "historical-review-no-retry")
+    replace_persisted_budget(task_store, claim.task.task_id, TaskBudget(max_attempts=4))
+
+    with pytest.raises(AttemptLimitExceededError):
+        transition_claim(task_store, claim, TaskStatus.REVIEW, TaskStatus.READY)
+
+    assert task_store.get_task(claim.task.task_id).status == TaskStatus.REVIEW
+    with sqlite3.connect(task_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT status FROM task_attempts WHERE attempt_id = ?",
+            (claim.attempt_id,),
+        ).fetchone() == ("running",)
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.ACCEPTED, TaskStatus.REJECTED, TaskStatus.CANCELLED],
+)
+def test_terminal_task_statuses_remain_terminal(
+    task_store: TaskStore, terminal_status: TaskStatus
+) -> None:
+    task = TaskSpec(
+        task_id=f"terminal-{terminal_status.value}",
+        run_id="run-terminal",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Terminal states do not reopen",
+        output_contract="patch",
+        status=terminal_status,
+    )
+    task_store.save_task(task)
+
+    with pytest.raises(InvalidStateTransitionError):
+        task_store.update_status(task.task_id, TaskStatus.READY)
+
+    assert task_store.get_task(task.task_id).status == terminal_status
+
+
+def test_global_cap_allows_three_attempts_then_expired_recovery_fails(
+    task_store: TaskStore,
+) -> None:
+    task = TaskSpec(
+        task_id="global-cap-three-attempts",
+        run_id="run-global-cap-three",
+        agent_role=AgentRole.IMPLEMENTER,
+        goal="Use the full global attempt limit but never exceed it",
+        output_contract="patch",
+        budget=TaskBudget(max_attempts=3),
+        status=TaskStatus.READY,
+    )
+    task_store.save_task(task)
+
+    for attempt_no in (1, 2):
+        result = task_store.claim_next_task(
+            worker_id="worker-global-three",
+            claim_request_id=f"claim-global-three-{attempt_no}",
+        )
+        assert result.claim is not None
+        assert result.claim.attempt_no == attempt_no
+        transition_claim(
+            task_store, result.claim, TaskStatus.RUNNING, TaskStatus.FAILED
+        )
+        retried = task_store.retry_task(task.task_id)
+        assert retried.status == TaskStatus.READY
+        assert retried.attempt == attempt_no
+
+    final_claim_result = task_store.claim_next_task(
+        worker_id="worker-global-three",
+        claim_request_id="claim-global-three-3",
+    )
+    assert final_claim_result.claim is not None
+    assert final_claim_result.claim.attempt_no == 3
+    expire_attempt(task_store, final_claim_result.claim)
+
+    recovered = task_store.recover_expired_attempts()
+
+    assert [item.status for item in recovered] == [TaskStatus.FAILED]
+    assert recovered[0].attempt == 3
+    with pytest.raises(AttemptLimitExceededError):
+        task_store.retry_task(task.task_id)
+    assert task_store.claim_next_task(
+        worker_id="worker-global-three",
+        claim_request_id="claim-global-three-after-limit",
+    ).claim is None

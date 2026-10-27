@@ -14,6 +14,7 @@ from swarm_forge.contracts.claim import (
     TaskClaim,
 )
 from swarm_forge.contracts.task import AgentRole, TaskBudget, TaskSpec, TaskStatus
+from swarm_forge.policy.attempt_policy import ATTEMPT_POLICY
 from swarm_forge.workflow.state_machine import validate_transition
 
 
@@ -227,6 +228,7 @@ class TaskStore:
             raise TaskClaimRequiredError(
                 "Tasks must enter RUNNING through an atomic claim."
             )
+        ATTEMPT_POLICY.validate_new_budget(task.budget)
 
         conn = self._get_connection()
         try:
@@ -295,8 +297,13 @@ class TaskStore:
     def _ensure_attempt_budget_remaining(
         task_id: str, attempt: int, max_attempts: int
     ) -> None:
-        if attempt >= max_attempts:
-            raise AttemptLimitExceededError(task_id, max_attempts)
+        if (
+            max_attempts > ATTEMPT_POLICY.max_attempts
+            or attempt >= max_attempts
+        ):
+            raise AttemptLimitExceededError(
+                task_id, min(max_attempts, ATTEMPT_POLICY.max_attempts)
+            )
 
     def update_status(self, task_id: str, new_status: TaskStatus) -> TaskSpec:
         """Atomically update a task's status with workflow state machine validation.
@@ -339,7 +346,7 @@ class TaskStore:
 
             # Validate via workflow state machine
             validate_transition(current_status, new_status)
-            if current_status == TaskStatus.FAILED and new_status == TaskStatus.READY:
+            if new_status == TaskStatus.READY:
                 budget = TaskBudget.model_validate_json(row["budget_json"])
                 self._ensure_attempt_budget_remaining(
                     task_id, row["attempt"], budget.max_attempts
@@ -419,6 +426,13 @@ class TaskStore:
                 or current_task.attempt != attempt_no
             ):
                 raise AttemptFencingError(task_id)
+
+            if new_task_status == TaskStatus.READY:
+                self._ensure_attempt_budget_remaining(
+                    task_id,
+                    current_task.attempt,
+                    current_task.budget.max_attempts,
+                )
 
             try:
                 lease_expires_at = datetime.fromisoformat(
@@ -629,7 +643,9 @@ class TaskStore:
 
                 current_status = TaskStatus(row["status"])
                 budget = TaskBudget.model_validate_json(row["budget_json"])
-                exhausted = row["attempt"] >= budget.max_attempts
+                exhausted = not ATTEMPT_POLICY.has_remaining_attempts(
+                    budget, row["attempt"]
+                )
                 target_status = TaskStatus.FAILED if exhausted else TaskStatus.READY
                 if exhausted:
                     validate_transition(current_status, TaskStatus.FAILED)
@@ -777,7 +793,9 @@ class TaskStore:
                     continue
 
                 validate_transition(task.status, TaskStatus.RUNNING)
-                max_attempts = task.budget.max_attempts
+                max_attempts = min(
+                    task.budget.max_attempts, ATTEMPT_POLICY.max_attempts
+                )
                 attempt_no = task.attempt + 1
                 attempt_id = str(uuid4())
                 started_at = datetime.now(UTC)
@@ -862,7 +880,7 @@ class TaskStore:
     def _claim_skip_reason(
         self, conn: sqlite3.Connection, task: TaskSpec
     ) -> ClaimSkipReason | None:
-        if task.attempt >= task.budget.max_attempts:
+        if not ATTEMPT_POLICY.has_remaining_attempts(task.budget, task.attempt):
             return ClaimSkipReason.ATTEMPT_BUDGET_EXHAUSTED
 
         active_attempt = conn.execute(
@@ -913,9 +931,9 @@ class TaskStore:
             validate_transition(current_status, TaskStatus.READY)
 
             budget = TaskBudget.model_validate_json(row["budget_json"])
-            max_attempts = budget.max_attempts
+            max_attempts = min(budget.max_attempts, ATTEMPT_POLICY.max_attempts)
             self._ensure_attempt_budget_remaining(
-                task_id, row["attempt"], max_attempts
+                task_id, row["attempt"], budget.max_attempts
             )
 
             cursor = conn.execute(

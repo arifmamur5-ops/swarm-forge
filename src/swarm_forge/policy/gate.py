@@ -1,6 +1,7 @@
 from swarm_forge.contracts.event import AuditEvent, EventType
 from swarm_forge.contracts.policy import PolicyDecision
 from swarm_forge.contracts.task import TaskSpec
+from swarm_forge.policy.attempt_policy import ATTEMPT_POLICY
 from swarm_forge.storage.audit_log import AuditLog
 
 DEFAULT_ALLOWED_TOOLS = frozenset(
@@ -24,15 +25,18 @@ class PolicyGate:
         self,
         *,
         allowed_tools: frozenset[str] = DEFAULT_ALLOWED_TOOLS,
-        max_attempts: int = 3,
+        max_attempts: int | None = None,
         max_timeout_seconds: int = 600,
         max_changed_files: int = 10,
         max_input_tokens: int = 8000,
         max_output_tokens: int = 4000,
         policy_version: str = "1.0",
     ) -> None:
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
+        if max_attempts is not None and max_attempts != ATTEMPT_POLICY.max_attempts:
+            raise ValueError(
+                "max_attempts must match the global attempt policy "
+                f"({ATTEMPT_POLICY.max_attempts})"
+            )
         if max_timeout_seconds < 1:
             raise ValueError("max_timeout_seconds must be at least 1")
         if max_changed_files < 1:
@@ -43,7 +47,6 @@ class PolicyGate:
             raise ValueError("max_output_tokens must be at least 1")
 
         self._allowed_tools = allowed_tools
-        self._max_attempts = max_attempts
         self._max_timeout_seconds = max_timeout_seconds
         self._max_changed_files = max_changed_files
         self._max_input_tokens = max_input_tokens
@@ -62,7 +65,7 @@ class PolicyGate:
                 f"tools_not_allowed:{','.join(unknown_tools)}"
             )
 
-        if task.attempt >= task.budget.max_attempts or task.budget.max_attempts > self._max_attempts:
+        if not ATTEMPT_POLICY.has_remaining_attempts(task.budget, task.attempt):
             reasons.append("max_attempts_exceeded")
 
         if task.budget.timeout_seconds > self._max_timeout_seconds:

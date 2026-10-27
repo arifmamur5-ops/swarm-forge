@@ -4,6 +4,7 @@ from datetime import datetime
 
 from swarm_forge.contracts.claim import AttemptStatus, ClaimResult
 from swarm_forge.contracts.task import TaskSpec, TaskStatus
+from swarm_forge.policy.attempt_policy import ATTEMPT_POLICY
 from swarm_forge.storage.task_store import TaskNotFoundError, TaskStore
 
 
@@ -34,6 +35,10 @@ class WorkflowEngine:
                 f"Task '{task_id}' must be CREATED before validation; "
                 f"current status is '{task.status.value}'."
             )
+        if not ATTEMPT_POLICY.accepts_new_budget(task.budget):
+            raise WorkflowValidationError(
+                "Task budget exceeds the global max_attempts policy."
+            )
 
         for dependency_id in task.depends_on:
             if dependency_id == task.task_id:
@@ -61,6 +66,8 @@ class WorkflowEngine:
 
         for task in tasks:
             if task.status != TaskStatus.VALIDATED:
+                continue
+            if not ATTEMPT_POLICY.accepts_new_budget(task.budget):
                 continue
 
             dependencies = [
