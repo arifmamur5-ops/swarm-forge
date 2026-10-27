@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+import swarm_forge.storage.audit_log as audit_log_module
 from swarm_forge.storage.audit_log import AuditLog
 
 
@@ -22,6 +23,13 @@ def test_append_and_read_event(tmp_path) -> None:
     assert events[0]["event_id"] == event["event_id"]
     assert events[0]["payload"] == {"role": "implementer"}
     assert log.verify_chain()
+
+
+def test_empty_chain_verifies(tmp_path) -> None:
+    log = AuditLog(tmp_path / "audit.db")
+
+    assert log.verify_chain() is True
+
 
 def test_hash_chain_links_events(tmp_path) -> None:
     log = AuditLog(tmp_path / "audit.db")
@@ -74,6 +82,105 @@ def test_payload_tampering_is_detected(tmp_path) -> None:
         )
 
     assert not log.verify_chain()
+
+
+@pytest.mark.parametrize("payload_json", ["{malformed", "[]", '"scalar"', "null"])
+def test_unverifiable_payload_returns_false(tmp_path, payload_json: str) -> None:
+    db_path = tmp_path / "audit.db"
+    log = AuditLog(db_path)
+    log.append(
+        run_id="run-001",
+        event_type="run_created",
+        correlation_id="corr-001",
+        payload={"valid": True},
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE audit_events SET payload_json = ?",
+            (payload_json,),
+        )
+
+    assert log.verify_chain() is False
+
+
+def test_deeply_nested_valid_json_returns_false(tmp_path) -> None:
+    db_path = tmp_path / "audit.db"
+    log = AuditLog(db_path)
+    log.append(
+        run_id="run-001",
+        event_type="run_created",
+        correlation_id="corr-001",
+        payload={"valid": True},
+    )
+    deeply_nested_json = "[" * 2000 + "0" + "]" * 2000
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE audit_events SET payload_json = ?",
+            (deeply_nested_json,),
+        )
+
+    assert log.verify_chain() is False
+
+
+def test_canonical_serialization_recursion_error_returns_false(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = AuditLog(tmp_path / "audit.db")
+    log.append(
+        run_id="run-001",
+        event_type="run_created",
+        correlation_id="corr-001",
+        payload={"valid": True},
+    )
+
+    def fail_to_serialize(data: dict[str, object]) -> str:
+        raise RecursionError("payload nesting is too deep")
+
+    monkeypatch.setattr(audit_log_module, "canonical_json", fail_to_serialize)
+
+    assert log.verify_chain() is False
+
+
+def test_prev_hash_tampering_is_detected(tmp_path) -> None:
+    db_path = tmp_path / "audit.db"
+    log = AuditLog(db_path)
+    log.append(
+        run_id="run-001",
+        event_type="run_created",
+        correlation_id="corr-001",
+        payload={"step": 1},
+    )
+    log.append(
+        run_id="run-001",
+        event_type="task_created",
+        correlation_id="corr-001",
+        payload={"step": 2},
+    )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE audit_events SET prev_hash = ? WHERE sequence = 2",
+            ("f" * 64,),
+        )
+
+    assert log.verify_chain() is False
+
+
+def test_database_failure_is_not_reported_as_invalid_chain(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = AuditLog(tmp_path / "audit.db")
+
+    def fail_to_connect() -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database unavailable")
+
+    monkeypatch.setattr(log, "_connect", fail_to_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        log.verify_chain()
+
 
 def test_blank_run_id_is_rejected(tmp_path) -> None:
     log = AuditLog(tmp_path / "audit.db")

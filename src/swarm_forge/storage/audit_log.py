@@ -247,24 +247,35 @@ class AuditLog:
         return events
 
     def verify_chain(self) -> bool:
-        events = self.list_events()
+        try:
+            events = self.list_events()
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            # Stored payloads are untrusted input during verification. Database
+            # errors are deliberately not caught here.
+            return False
+
         expected_prev_hash = GENESIS_HASH
 
         for event in events:
+            if not isinstance(event["payload"], dict):
+                return False
             if event["prev_hash"] != expected_prev_hash:
                 return False
 
-            payload_json = canonical_json(event["payload"])
-            calculated = calculate_event_hash(
-                event_id=event["event_id"],
-                run_id=event["run_id"],
-                task_id=event["task_id"],
-                event_type=event["event_type"],
-                timestamp=event["timestamp"],
-                correlation_id=event["correlation_id"],
-                payload_json=payload_json,
-                prev_hash=event["prev_hash"],
-            )
+            try:
+                payload_json = canonical_json(event["payload"])
+                calculated = calculate_event_hash(
+                    event_id=event["event_id"],
+                    run_id=event["run_id"],
+                    task_id=event["task_id"],
+                    event_type=event["event_type"],
+                    timestamp=event["timestamp"],
+                    correlation_id=event["correlation_id"],
+                    payload_json=payload_json,
+                    prev_hash=event["prev_hash"],
+                )
+            except (TypeError, ValueError, RecursionError):
+                return False
 
             if calculated != event["event_hash"]:
                 return False
