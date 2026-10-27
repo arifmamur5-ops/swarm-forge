@@ -264,18 +264,19 @@ class AuditLog:
 
             try:
                 payload_json = canonical_json(event["payload"])
-                calculated = calculate_event_hash(
-                    event_id=event["event_id"],
-                    run_id=event["run_id"],
-                    task_id=event["task_id"],
-                    event_type=event["event_type"],
-                    timestamp=event["timestamp"],
-                    correlation_id=event["correlation_id"],
-                    payload_json=payload_json,
-                    prev_hash=event["prev_hash"],
-                )
             except (TypeError, ValueError, RecursionError):
                 return False
+
+            calculated = calculate_event_hash(
+                event_id=event["event_id"],
+                run_id=event["run_id"],
+                task_id=event["task_id"],
+                event_type=event["event_type"],
+                timestamp=event["timestamp"],
+                correlation_id=event["correlation_id"],
+                payload_json=payload_json,
+                prev_hash=event["prev_hash"],
+            )
 
             if calculated != event["event_hash"]:
                 return False

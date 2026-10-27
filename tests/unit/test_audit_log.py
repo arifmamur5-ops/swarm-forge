@@ -143,6 +143,29 @@ def test_canonical_serialization_recursion_error_returns_false(
     assert log.verify_chain() is False
 
 
+@pytest.mark.parametrize("error_type", [TypeError, ValueError, RecursionError])
+def test_hash_calculation_errors_propagate(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    log = AuditLog(tmp_path / "audit.db")
+    log.append(
+        run_id="run-001",
+        event_type="run_created",
+        correlation_id="corr-001",
+        payload={"valid": True},
+    )
+
+    def fail_to_calculate_hash(**kwargs: str | None) -> str:
+        raise error_type("internal hash calculation failure")
+
+    monkeypatch.setattr(
+        audit_log_module, "calculate_event_hash", fail_to_calculate_hash
+    )
+
+    with pytest.raises(error_type, match="internal hash calculation failure"):
+        log.verify_chain()
+
+
 def test_prev_hash_tampering_is_detected(tmp_path) -> None:
     db_path = tmp_path / "audit.db"
     log = AuditLog(db_path)
