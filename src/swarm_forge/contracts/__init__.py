@@ -11,7 +11,8 @@ from swarm_forge.contracts.claim import (
     SkippedClaimCandidate,
     TaskClaim,
 )
-from swarm_forge.contracts.event import AuditEvent, EventType
+from swarm_forge.contracts.event import AuditEvent, EventType, LifecycleEvent
+from swarm_forge.contracts.operation import OperationContext
 from swarm_forge.contracts.task import (
     AgentRole,
     TaskBudget,
@@ -30,6 +31,8 @@ __all__ = [
     "ClaimResult",
     "ClaimSkipReason",
     "EventType",
+    "LifecycleEvent",
+    "OperationContext",
     "SkippedClaimCandidate",
     "TaskBudget",
     "TaskClaim",

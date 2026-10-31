@@ -77,7 +77,7 @@ class ClaimRequestConflictError(ValueError):
 class TaskStore:
     """SQLite-backed persistent repository for TaskSpec objects."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: str | Path = "swarm_forge.db") -> None:
         self.db_path = Path(db_path) if isinstance(db_path, str) else db_path
@@ -206,6 +206,72 @@ class TaskStore:
                     """
                 )
                 conn.execute("PRAGMA user_version = 2")
+                current_version = 2
+
+            if current_version < 3:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lifecycle_outbox_operations (
+                        operation_id TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        operation_fingerprint TEXT NOT NULL,
+                        event_manifest TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (operation_id, idempotency_key)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lifecycle_outbox (
+                        sequence_no INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        operation_id TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        event_discriminator TEXT NOT NULL,
+                        schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+                        run_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        attempt_id TEXT,
+                        correlation_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        event_json TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (
+                            status IN ('pending', 'delivered', 'poison')
+                        ),
+                        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                        next_attempt_at TEXT NOT NULL,
+                        lease_token TEXT,
+                        lease_expires_at TEXT,
+                        delivered_at TEXT,
+                        last_error TEXT,
+                        last_error_at TEXT,
+                        created_at TEXT NOT NULL,
+                        UNIQUE (operation_id, event_discriminator),
+                        FOREIGN KEY (operation_id, idempotency_key)
+                            REFERENCES lifecycle_outbox_operations(
+                                operation_id, idempotency_key
+                            ),
+                        CHECK (
+                            (lease_token IS NULL AND lease_expires_at IS NULL)
+                            OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+                        ),
+                        CHECK (
+                            (status = 'delivered' AND delivered_at IS NOT NULL)
+                            OR (status != 'delivered' AND delivered_at IS NULL)
+                        )
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_lifecycle_outbox_pending
+                    ON lifecycle_outbox(status, sequence_no)
+                    WHERE status = 'pending'
+                    """
+                )
+                conn.execute("PRAGMA user_version = 3")
 
             conn.commit()
         except Exception:
